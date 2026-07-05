@@ -321,6 +321,61 @@ pub async fn start_local_surfnet_runloop(
     .await
 }
 
+/// A wall-clock schedule for `BlockProductionMode::Clock` block production.
+///
+/// Chain time is derived from block count (`updated_at += slot_time` per block), so the
+/// clock stays true only if exactly one block is produced per `slot_time` of real time.
+/// The naive one-block-per-tick loop violates this two ways: the blockhash-rotation
+/// block emitted every `BLOCKHASH_SLOT_TTL` ticks mints `slot_time` of chain time out of
+/// zero elapsed real time (a permanent +1/75 ≈ +1.33% clock drift, ~+19 min/day), and
+/// tick-timer error (sleep is a floor, not a cadence) skews the rate. Anchoring
+/// production to this schedule makes block count — and therefore chain time and the
+/// `calculate_block_time_for_slot` slot↔time mapping — track wall time exactly: each
+/// tick produces only the blocks the schedule is due, so early blocks (blockhash
+/// rotation) are absorbed by producing nothing until the schedule catches up, and slow
+/// ticks are healed by producing the shortfall.
+///
+/// The anchor re-bases on any event that changes the wall↔slot mapping: time travel,
+/// clock pause/resume (a pause must stay a hole in chain time, not be back-filled),
+/// slot-time updates, and block-production-mode changes.
+struct BlockSchedule {
+    /// Local absolute slot at the anchor instant.
+    anchor_slot: u64,
+    /// Wall-clock time (ms) at the anchor instant.
+    anchor_wall_ms: u64,
+}
+
+/// Upper bound on catch-up blocks per tick, so a backlog closes over several ticks
+/// rather than one unbounded burst.
+const SCHEDULE_MAX_CATCHUP_PER_TICK: u64 = 512;
+/// Backlogs beyond this (~1 day at 400ms; e.g. the host was suspended) are dropped by
+/// re-anchoring instead of back-filled with hundreds of thousands of empty blocks.
+const SCHEDULE_MAX_BACKLOG_SLOTS: u64 = 216_000;
+/// A chain this far ahead of schedule cannot be explained by blockhash-rotation blocks
+/// (one slot each, reabsorbed within a tick); treat it as an external slot change and
+/// re-anchor.
+const SCHEDULE_MAX_AHEAD_SLOTS: u64 = 150;
+
+impl BlockSchedule {
+    fn anchored_at(anchor_slot: u64, anchor_wall_ms: u64) -> Self {
+        Self {
+            anchor_slot,
+            anchor_wall_ms,
+        }
+    }
+
+    /// The slot the schedule calls for at `now_ms`. Saturates at the anchor when the
+    /// wall clock steps backward, freezing production instead of reversing it.
+    fn target_slot(&self, now_ms: u64, slot_time: u64) -> u64 {
+        self.anchor_slot
+            .saturating_add(now_ms.saturating_sub(self.anchor_wall_ms) / slot_time.max(1))
+    }
+}
+
+fn wall_clock_ms() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn start_block_production_runloop(
     clock_event_rx: Receiver<ClockEvent>,
@@ -344,15 +399,43 @@ pub async fn start_block_production_runloop(
         expiry_duration_ms.map(|expiry_val| Utc::now().timestamp_millis() as u64 + expiry_val);
     let global_skip_sig_verify = simnet_config.skip_signature_verification;
     let ix_profiling_initially_enabled = simnet_config.instruction_profiling_enabled;
+    let mut schedule = BlockSchedule::anchored_at(
+        svm_locker.with_svm_reader(|svm| svm.latest_epoch_info.absolute_slot),
+        wall_clock_ms(),
+    );
     loop {
-        let mut do_produce_block = false;
+        let mut blocks_due: u64 = 0;
 
         select! {
             recv(clock_event_rx) -> msg => if let Ok(event) = msg {
                 match event {
                     ClockEvent::Tick => {
                         if block_production_mode.eq(&BlockProductionMode::Clock) {
-                            do_produce_block = true;
+                            let now_ms = wall_clock_ms();
+                            let (current_slot, slot_time) = svm_locker.with_svm_reader(|svm| {
+                                (svm.latest_epoch_info.absolute_slot, svm.slot_time)
+                            });
+                            let target_slot = schedule.target_slot(now_ms, slot_time);
+                            if target_slot >= current_slot {
+                                let due = target_slot - current_slot;
+                                if due > SCHEDULE_MAX_BACKLOG_SLOTS {
+                                    let _ = svm_locker.simnet_events_tx().send(SimnetEvent::warn(format!(
+                                        "Clock schedule fell {} slots behind (wall clock jumped forward?); re-anchoring without back-filling",
+                                        due
+                                    )));
+                                    schedule = BlockSchedule::anchored_at(current_slot, now_ms);
+                                } else {
+                                    blocks_due = due.min(SCHEDULE_MAX_CATCHUP_PER_TICK);
+                                }
+                            } else if current_slot - target_slot > SCHEDULE_MAX_AHEAD_SLOTS {
+                                let _ = svm_locker.simnet_events_tx().send(SimnetEvent::warn(format!(
+                                    "Chain is {} slots ahead of the clock schedule (external slot change?); re-anchoring",
+                                    current_slot - target_slot
+                                )));
+                                schedule = BlockSchedule::anchored_at(current_slot, now_ms);
+                            }
+                            // Slightly ahead (a blockhash-rotation block): produce nothing
+                            // until the schedule catches up.
                         }
 
                         if let Some(expiry_ms) = expiry_duration_ms {
@@ -370,7 +453,9 @@ pub async fn start_block_production_runloop(
                         }
                     }
                     ClockEvent::ExpireBlockHash => {
-                        do_produce_block = true;
+                        // Rotates the blockhash by producing a block ahead of schedule;
+                        // the schedule absorbs it by skipping the next due tick.
+                        blocks_due = 1;
                     }
                 }
             },
@@ -378,7 +463,7 @@ pub async fn start_block_production_runloop(
                 match event {
                     SimnetCommand::SlotForward(_key) => {
                         block_production_mode = BlockProductionMode::Manual;
-                        do_produce_block = true;
+                        blocks_due = 1;
                     }
                     SimnetCommand::SlotBackward(_key) => {
 
@@ -430,6 +515,13 @@ pub async fn start_block_production_runloop(
                         } else {
                             let _ = clock_command_tx.send(update);
                         }
+                        // Pause/resume/slot-time changes all break the wall↔slot mapping;
+                        // re-anchor so a pause stays a hole in chain time (not back-filled)
+                        // and a new slot_time takes effect only from now on.
+                        schedule = BlockSchedule::anchored_at(
+                            svm_locker.with_svm_reader(|svm| svm.latest_epoch_info.absolute_slot),
+                            wall_clock_ms(),
+                        );
                         continue
                     }
                     SimnetCommand::UpdateInternalClock(_, clock) => {
@@ -450,6 +542,12 @@ pub async fn start_block_production_runloop(
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
                             let _ = svm_writer.simnet_events_tx.send(SimnetEvent::SystemClockUpdated(clock));
                         });
+                        // Time travel moved the chain to a new slot; production resumes
+                        // from there at the normal cadence.
+                        schedule = BlockSchedule::anchored_at(
+                            svm_locker.with_svm_reader(|svm| svm.latest_epoch_info.absolute_slot),
+                            wall_clock_ms(),
+                        );
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
                         // Confirm the current block to materialize any scheduled overrides for this slot
@@ -470,12 +568,20 @@ pub async fn start_block_production_runloop(
                             let _ = svm_writer.simnet_events_tx.send(SimnetEvent::SystemClockUpdated(clock));
                             svm_writer.latest_epoch_info.clone()
                         });
+                        schedule =
+                            BlockSchedule::anchored_at(epoch_info.absolute_slot, wall_clock_ms());
 
                         // Send confirmation back
                         let _ = response_tx.send(epoch_info);
                     }
                     SimnetCommand::UpdateBlockProductionMode(update) => {
                         block_production_mode = update;
+                        // Slots produced under the previous mode are not a backlog to
+                        // catch up; clock production resumes from the current state.
+                        schedule = BlockSchedule::anchored_at(
+                            svm_locker.with_svm_reader(|svm| svm.latest_epoch_info.absolute_slot),
+                            wall_clock_ms(),
+                        );
                         continue
                     }
                     SimnetCommand::ProcessTransaction(_key, transaction, status_tx, skip_preflight, skip_sig_verify_override) => {
@@ -485,7 +591,7 @@ pub async fn start_block_production_runloop(
                             let _ = svm_locker.simnet_events_tx().send(SimnetEvent::error(format!("Failed to process transaction: {}", e)));
                        }
                        if block_production_mode.eq(&BlockProductionMode::Transaction) {
-                           do_produce_block = true;
+                           blocks_due = 1;
                        }
                     }
                     SimnetCommand::Terminate(_) => {
@@ -520,7 +626,7 @@ pub async fn start_block_production_runloop(
                     }
                     SimnetCommand::AirdropProcessed => {
                        if block_production_mode.eq(&BlockProductionMode::Transaction) {
-                           do_produce_block = true;
+                           blocks_due = 1;
                        }
                     }
                 }
@@ -528,7 +634,7 @@ pub async fn start_block_production_runloop(
         }
 
         {
-            if do_produce_block {
+            for _ in 0..blocks_due {
                 svm_locker
                     .confirm_current_block(&remote_client_with_commitment)
                     .await?;
@@ -1054,4 +1160,33 @@ async fn start_ws_rpc_server_runloop(
         .map_err(|_| "Failed to receive WebSocket RPC server startup result".to_string())??;
 
     Ok((_ws_handle, close_handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_targets_one_slot_per_slot_time() {
+        let schedule = BlockSchedule::anchored_at(100, 10_000);
+        assert_eq!(schedule.target_slot(10_000, 400), 100);
+        assert_eq!(schedule.target_slot(10_399, 400), 100);
+        assert_eq!(schedule.target_slot(10_400, 400), 101);
+        assert_eq!(schedule.target_slot(14_000, 400), 110);
+    }
+
+    #[test]
+    fn schedule_freezes_when_wall_clock_steps_backward() {
+        let schedule = BlockSchedule::anchored_at(100, 10_000);
+        assert_eq!(schedule.target_slot(9_000, 400), 100);
+    }
+
+    #[test]
+    fn schedule_respects_slot_time() {
+        let schedule = BlockSchedule::anchored_at(0, 0);
+        assert_eq!(schedule.target_slot(4_000, 400), 10);
+        assert_eq!(schedule.target_slot(4_000, 800), 5);
+        // A zero slot_time must not divide by zero.
+        assert_eq!(schedule.target_slot(4_000, 0), 4_000);
+    }
 }
