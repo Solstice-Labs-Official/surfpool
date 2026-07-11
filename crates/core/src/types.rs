@@ -1182,6 +1182,15 @@ pub enum TimeTravelConfig {
     AbsoluteEpoch(Epoch),
     AbsoluteSlot(Slot),
     AbsoluteTimestamp(u64),
+    /// Anchor slot and wall time independently. The single-axis variants derive
+    /// one value from the other through `slot_time`, which cannot express a
+    /// snapshot's (mainnet slot, recorded wall time) pair on a fresh offline
+    /// surfnet. `timestamp` is unix seconds.
+    #[serde(rename_all = "camelCase")]
+    AbsoluteSlotAndTimestamp {
+        slot: Slot,
+        timestamp: u64,
+    },
 }
 
 impl Default for TimeTravelConfig {

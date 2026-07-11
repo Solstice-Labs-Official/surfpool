@@ -118,6 +118,40 @@ pub fn calculate_absolute_slot_clock(
     })
 }
 
+/// Calculates the new clock state when anchoring slot and wall time independently.
+///
+/// Unlike [`calculate_absolute_slot_clock`], the timestamp is taken as given
+/// (unix seconds) instead of being derived from the slot jump, so a snapshot's
+/// mainnet-era slot can be paired with its recorded wall time without dragging
+/// chain time years ahead. The slot must still move forward.
+pub fn calculate_absolute_slot_and_timestamp_clock(
+    new_absolute_slot: u64,
+    unix_timestamp_secs: u64,
+    current_absolute_slot: u64,
+    epoch_info: &EpochInfo,
+) -> Result<Clock, TimeTravelError> {
+    if new_absolute_slot < current_absolute_slot {
+        return Err(TimeTravelError::PastSlot {
+            target: new_absolute_slot,
+            current: current_absolute_slot,
+        });
+    }
+    if epoch_info.slots_in_epoch == 0 {
+        return Err(TimeTravelError::ZeroSlotsInEpoch);
+    }
+
+    let epoch = new_absolute_slot / epoch_info.slots_in_epoch;
+    let slot = new_absolute_slot - epoch * epoch_info.slots_in_epoch;
+
+    Ok(Clock {
+        slot,
+        epoch_start_timestamp: unix_timestamp_secs as i64,
+        epoch,
+        leader_schedule_epoch: 0,
+        unix_timestamp: unix_timestamp_secs as i64,
+    })
+}
+
 /// Calculates the new clock state when traveling to an absolute epoch.
 ///
 /// # Arguments
@@ -197,6 +231,14 @@ pub fn calculate_time_travel_clock(
             slot_time,
             epoch_info,
         ),
+        TimeTravelConfig::AbsoluteSlotAndTimestamp { slot, timestamp } => {
+            calculate_absolute_slot_and_timestamp_clock(
+                *slot,
+                *timestamp,
+                epoch_info.absolute_slot,
+                epoch_info,
+            )
+        }
         TimeTravelConfig::AbsoluteEpoch(new_epoch) => calculate_absolute_epoch_clock(
             *new_epoch,
             epoch_info.epoch,
@@ -507,5 +549,66 @@ mod tests {
 
         assert_eq!(clock.slot, 432_000); // Should advance by one slot: 431_999 + 1
         assert_eq!(clock.epoch, 1); // Should stay in same epoch since 432_000 < 864_000
+    }
+
+    #[test]
+    fn test_calculate_absolute_slot_and_timestamp_clock_independent_axes() {
+        // Offline snapshot replay: fresh surfnet at a tiny slot, anchoring onto a
+        // mainnet-era slot while keeping the recorded wall time.
+        let epoch_info = create_test_epoch_info(0, 47, 47);
+        let target_slot = 432_212_729;
+        let target_ts = 1_783_769_107;
+
+        let clock = calculate_absolute_slot_and_timestamp_clock(
+            target_slot,
+            target_ts,
+            epoch_info.absolute_slot,
+            &epoch_info,
+        )
+        .unwrap();
+
+        assert_eq!(clock.epoch, target_slot / 432_000);
+        assert_eq!(clock.slot, target_slot % 432_000);
+        assert_eq!(clock.unix_timestamp, target_ts as i64);
+        assert_eq!(clock.epoch_start_timestamp, target_ts as i64);
+    }
+
+    #[test]
+    fn test_calculate_absolute_slot_and_timestamp_clock_past_slot() {
+        let epoch_info = create_test_epoch_info(1, 1000, 433_000);
+
+        let result = calculate_absolute_slot_and_timestamp_clock(
+            433_000 - 1,
+            1_783_769_107,
+            epoch_info.absolute_slot,
+            &epoch_info,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            TimeTravelError::PastSlot {
+                target: 432_999,
+                current: 433_000
+            }
+        ));
+    }
+
+    #[test]
+    fn test_time_travel_config_slot_and_timestamp_wire_shape() {
+        let config: TimeTravelConfig = serde_json::from_value(serde_json::json!({
+            "absoluteSlotAndTimestamp": { "slot": 42, "timestamp": 7 }
+        }))
+        .unwrap();
+        assert_eq!(
+            config,
+            TimeTravelConfig::AbsoluteSlotAndTimestamp {
+                slot: 42,
+                timestamp: 7
+            }
+        );
+
+        let clock =
+            calculate_time_travel_clock(&config, 0, 400, &create_test_epoch_info(0, 0, 0)).unwrap();
+        assert_eq!(clock.slot, 42);
+        assert_eq!(clock.unix_timestamp, 7);
     }
 }
