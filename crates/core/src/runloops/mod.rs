@@ -533,13 +533,15 @@ pub async fn start_block_production_runloop(
                         }
 
                         svm_locker.with_svm_writer(|svm_writer| {
+                            // clock.slot is the absolute slot, sysvar-ready — the
+                            // same form block confirmation stamps between travels.
                             svm_writer.inner.set_sysvar(&clock);
                             svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
+                            svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
+                            svm_writer.latest_epoch_info.slot_index = clock.slot.saturating_sub(
+                                clock.epoch.saturating_mul(svm_writer.latest_epoch_info.slots_in_epoch),
+                            );
                             let _ = svm_writer.simnet_events_tx.send(SimnetEvent::SystemClockUpdated(clock));
                         });
                         // Time travel moved the chain to a new slot; production resumes
@@ -558,13 +560,15 @@ pub async fn start_block_production_runloop(
                         }
 
                         let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
+                            // clock.slot is the absolute slot, sysvar-ready — the
+                            // same form block confirmation stamps between travels.
                             svm_writer.inner.set_sysvar(&clock);
                             svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
+                            svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
+                            svm_writer.latest_epoch_info.slot_index = clock.slot.saturating_sub(
+                                clock.epoch.saturating_mul(svm_writer.latest_epoch_info.slots_in_epoch),
+                            );
                             let _ = svm_writer.simnet_events_tx.send(SimnetEvent::SystemClockUpdated(clock));
                             svm_writer.latest_epoch_info.clone()
                         });

@@ -9,6 +9,12 @@ use crate::types::{TimeTravelConfig, TimeTravelError};
 /// in a Solana network. These functions are extracted from the RPC implementation to make
 /// them testable and reusable.
 ///
+/// Every function returns a sysvar-ready `Clock`: its `slot` field is the
+/// ABSOLUTE slot, exactly as programs read it on-chain and exactly as block
+/// production stamps it. Until the next produced block, the returned clock is
+/// what transactions execute against, so an intra-epoch index here would make
+/// slot arithmetic in programs go backwards.
+///
 /// Calculates the new clock state when traveling to an absolute timestamp.
 ///
 /// # Arguments
@@ -43,31 +49,17 @@ pub fn calculate_absolute_timestamp_clock(
     }
 
     let time_jump_in_ms = timestamp_target - current_updated_at;
-    let time_jump_in_absolute_slots = time_jump_in_ms / slot_time;
-    let remaining_slots_for_current_epoch = epoch_info
-        .slots_in_epoch
-        .saturating_sub(epoch_info.slot_index);
-
-    let time_jump_in_epochs = if time_jump_in_absolute_slots >= remaining_slots_for_current_epoch {
-        (time_jump_in_absolute_slots - remaining_slots_for_current_epoch)
-            / epoch_info.slots_in_epoch
-    } else {
-        0
-    };
-
-    let time_jump_in_relative_slots = if time_jump_in_epochs == 0 {
-        epoch_info.slot_index + time_jump_in_absolute_slots
-    } else {
-        time_jump_in_absolute_slots - (time_jump_in_epochs * epoch_info.slots_in_epoch)
-    };
+    let time_jump_in_slots = time_jump_in_ms / slot_time;
+    let new_absolute_slot = epoch_info.absolute_slot + time_jump_in_slots;
+    let epoch = new_absolute_slot / epoch_info.slots_in_epoch;
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
 
     Ok(Clock {
-        slot: time_jump_in_relative_slots,
+        slot: new_absolute_slot,
         epoch_start_timestamp: timestamp_target_seconds as i64,
-        epoch: epoch_info.epoch + time_jump_in_epochs,
+        epoch,
         leader_schedule_epoch: 0,
         unix_timestamp: timestamp_target_seconds as i64,
     })
@@ -99,18 +91,20 @@ pub fn calculate_absolute_slot_clock(
             current: current_absolute_slot,
         });
     }
+    if epoch_info.slots_in_epoch == 0 {
+        return Err(TimeTravelError::ZeroSlotsInEpoch);
+    }
 
     let time_jump_in_absolute_slots = new_absolute_slot - current_absolute_slot;
     let time_jump_in_ms = time_jump_in_absolute_slots * slot_time;
     let timestamp_target = current_updated_at + time_jump_in_ms;
     let epoch = new_absolute_slot / epoch_info.slots_in_epoch;
-    let slot = new_absolute_slot - epoch * epoch_info.slots_in_epoch;
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
 
     Ok(Clock {
-        slot,
+        slot: new_absolute_slot,
         epoch_start_timestamp: timestamp_target_seconds as i64,
         epoch,
         leader_schedule_epoch: 0,
@@ -141,10 +135,9 @@ pub fn calculate_absolute_slot_and_timestamp_clock(
     }
 
     let epoch = new_absolute_slot / epoch_info.slots_in_epoch;
-    let slot = new_absolute_slot - epoch * epoch_info.slots_in_epoch;
 
     Ok(Clock {
-        slot,
+        slot: new_absolute_slot,
         epoch_start_timestamp: unix_timestamp_secs as i64,
         epoch,
         leader_schedule_epoch: 0,
@@ -190,7 +183,7 @@ pub fn calculate_absolute_epoch_clock(
     let timestamp_target_seconds = timestamp_target / 1000;
 
     Ok(Clock {
-        slot: 0,
+        slot: new_absolute_slot,
         epoch_start_timestamp: timestamp_target_seconds as i64,
         epoch: new_epoch,
         leader_schedule_epoch: 0,
@@ -281,7 +274,8 @@ mod tests {
         assert_eq!(clock.unix_timestamp, target_time as i64 / 1_000);
         assert_eq!(clock.epoch_start_timestamp, target_time as i64 / 1_000);
         assert_eq!(clock.epoch, 1); // Should stay in same epoch
-        assert_eq!(clock.slot, 1000 + (1_000_000 / 400)); // Should advance by time difference
+        // Absolute slot advances from the current absolute slot by the jump
+        assert_eq!(clock.slot, 433_000 + (1_000_000 / 400));
     }
 
     #[test]
@@ -297,10 +291,10 @@ mod tests {
 
         assert_eq!(clock.unix_timestamp, target_time as i64 / 1000);
         assert_eq!(clock.epoch_start_timestamp, target_time as i64 / 1000);
-        // With 10 seconds and 400ms slot time, we advance 25,000 slots
-        // Starting from slot 431,000 in epoch 1, we should stay in epoch 1
-        // since 431,000 + 25,000 = 456,000 < 864,000 (end of epoch 1)
-        assert_eq!(clock.epoch, 1); // Should stay in same epoch
+        // With 10 seconds and 400ms slot time, we advance 25,000 slots:
+        // absolute 863,000 + 25,000 = 888,000, which crosses into epoch 2.
+        assert_eq!(clock.slot, 888_000);
+        assert_eq!(clock.epoch, 2);
     }
 
     #[test]
@@ -334,7 +328,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(clock.slot, target_slot % epoch_info.slots_in_epoch);
+        assert_eq!(clock.slot, target_slot);
         assert_eq!(clock.epoch, target_slot / epoch_info.slots_in_epoch);
         assert_eq!(
             clock.unix_timestamp,
@@ -358,12 +352,25 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(clock.slot, 0); // First slot of new epoch
+        assert_eq!(clock.slot, 864_000); // First absolute slot of epoch 2
         assert_eq!(clock.epoch, 2); // New epoch
         assert_eq!(
             clock.unix_timestamp,
             (current_time + slot_time) as i64 / 1_000
         );
+    }
+
+    #[test]
+    fn test_calculate_absolute_slot_clock_zero_slots_in_epoch() {
+        let mut epoch_info = create_test_epoch_info(1, 1000, 433_000);
+        epoch_info.slots_in_epoch = 0;
+
+        let result =
+            calculate_absolute_slot_clock(500_000, epoch_info.absolute_slot, 0, 400, &epoch_info);
+        assert!(matches!(
+            result.unwrap_err(),
+            TimeTravelError::ZeroSlotsInEpoch
+        ));
     }
 
     #[test]
@@ -403,7 +410,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(clock.slot, 0); // Always start at slot 0 of new epoch
+        assert_eq!(clock.slot, target_epoch * epoch_info.slots_in_epoch); // Epoch's first absolute slot
         assert_eq!(clock.epoch, target_epoch);
         assert_eq!(
             clock.unix_timestamp,
@@ -431,7 +438,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(clock.slot, 0);
+        assert_eq!(clock.slot, 432_000); // Epoch 1's first absolute slot
         assert_eq!(clock.epoch, 1);
         // When staying in the same epoch, no time should advance
         assert_eq!(clock.unix_timestamp, current_time as i64 / 1_000);
@@ -489,7 +496,7 @@ mod tests {
         let clock =
             calculate_time_travel_clock(&config, current_time, slot_time, &epoch_info).unwrap();
 
-        assert_eq!(clock.slot, 500_000 % epoch_info.slots_in_epoch);
+        assert_eq!(clock.slot, 500_000);
         assert_eq!(clock.epoch, 500_000 / epoch_info.slots_in_epoch);
     }
 
@@ -503,7 +510,7 @@ mod tests {
         let clock =
             calculate_time_travel_clock(&config, current_time, slot_time, &epoch_info).unwrap();
 
-        assert_eq!(clock.slot, 0);
+        assert_eq!(clock.slot, 5 * 432_000);
         assert_eq!(clock.epoch, 5);
     }
 
@@ -547,8 +554,9 @@ mod tests {
             calculate_absolute_timestamp_clock(target_time, current_time, slot_time, &epoch_info)
                 .unwrap();
 
-        assert_eq!(clock.slot, 432_000); // Should advance by one slot: 431_999 + 1
-        assert_eq!(clock.epoch, 1); // Should stay in same epoch since 432_000 < 864_000
+        // One slot past the epoch's last absolute slot lands on epoch 2's first
+        assert_eq!(clock.slot, 864_000);
+        assert_eq!(clock.epoch, 2);
     }
 
     #[test]
@@ -568,7 +576,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(clock.epoch, target_slot / 432_000);
-        assert_eq!(clock.slot, target_slot % 432_000);
+        assert_eq!(clock.slot, target_slot);
         assert_eq!(clock.unix_timestamp, target_ts as i64);
         assert_eq!(clock.epoch_start_timestamp, target_ts as i64);
     }
